@@ -129,14 +129,16 @@ async function refreshAccessTokenInternal(
         clearCachedAuth(auth.refresh);
         invalidateProjectContextCache(auth.refresh);
         try {
-          const clearedAuth: OAuthAuthDetails = {
-            type: 'oauth',
+          const clearedAuth = {
+            type: 'oauth' as const,
             refresh: formatRefreshParts({
               refreshToken: '',
               projectId: parts.projectId,
               managedProjectId: parts.managedProjectId
-            })
-          };
+            }),
+            access: '',
+            expires: 0
+          } as OAuthAuthDetails;
           await client.auth.set({
             path: { id: AGY_PROVIDER_ID },
             body: clearedAuth

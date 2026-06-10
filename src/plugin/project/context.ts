@@ -2,7 +2,7 @@ import { AGY_PROVIDER_ID } from '../../constants';
 import { formatRefreshParts, parseRefreshParts } from '../auth';
 import type { OAuthAuthDetails, PluginClient, ProjectContextResult } from '../types';
 import { loadManagedProject, onboardManagedProject } from '../../sdk/fetch_project';
-import { FREE_TIER_ID, LEGACY_TIER_ID, ProjectIdRequiredError, ProjectAccessDeniedError } from './types';
+import { FREE_TIER_ID, LEGACY_TIER_ID, ProjectIdRequiredError, ProjectAccessDeniedError, type LoadCodeAssistPayload } from './types';
 import {
   buildIneligibleTierMessage,
   getCacheKey,

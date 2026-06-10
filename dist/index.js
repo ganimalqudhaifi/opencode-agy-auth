@@ -14041,7 +14041,9 @@ async function refreshAccessTokenInternal(auth, client, parts) {
               refreshToken: "",
               projectId: parts.projectId,
               managedProjectId: parts.managedProjectId
-            })
+            }),
+            access: "",
+            expires: 0
           };
           await client.auth.set({
             path: { id: AGY_PROVIDER_ID },
