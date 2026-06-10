@@ -1,0 +1,199 @@
+import { randomUUID } from 'node:crypto';
+import * as os from 'node:os';
+import { AGY_CODE_ASSIST_ENDPOINT } from '../constants';
+import { agyFetch } from '../fetch';
+import { getAgyCliVersion, buildAgyCliUserAgent } from '../sdk/user-agent';
+
+let lastTrafficTime = 0;
+const TRAFFIC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * 模拟官方 Agy 客户端在后台定期发送的实验获取和指标遥测流量，以防止接口封禁或检测异常。
+ */
+export function simulateClientBackgroundTraffic(accessToken: string, projectId: string, userAgentModel?: string): void {
+  const now = Date.now();
+  if (now - lastTrafficTime < TRAFFIC_INTERVAL_MS) {
+    return;
+  }
+  lastTrafficTime = now;
+
+  // 异步静默发送，绝不阻塞编辑器的核心生成流程
+  Promise.all([
+    sendListExperiments(accessToken, userAgentModel),
+    sendCodeAssistMetrics(accessToken, projectId, userAgentModel),
+    sendTrajectoryAnalytics(accessToken, userAgentModel)
+  ]).catch((err) => {
+    console.warn(`[Agy] Failed to send background traffic: ${err}`);
+  });
+}
+
+async function sendListExperiments(accessToken: string, userAgentModel?: string) {
+  const url = `${AGY_CODE_ASSIST_ENDPOINT}/v1internal:listExperiments`;
+  const userAgent = buildAgyCliUserAgent(userAgentModel);
+
+  const response = await agyFetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': userAgent,
+      Authorization: `Bearer ${accessToken}`
+    },
+    body: '{}'
+  });
+  if (!response.ok) {
+    console.warn(`[Agy] listExperiments failed: ${response.status}`);
+  }
+}
+
+async function sendCodeAssistMetrics(accessToken: string, projectId: string, userAgentModel?: string) {
+  const url = `${AGY_CODE_ASSIST_ENDPOINT}/v1internal:recordCodeAssistMetrics`;
+  const userAgent = buildAgyCliUserAgent(userAgentModel);
+
+  const plat = os.platform();
+  const arch = os.arch();
+  
+  const platMap: Record<string, string> = {
+    darwin: 'DARWIN',
+    linux: 'LINUX',
+    win32: 'WINDOWS'
+  };
+  const archMap: Record<string, string> = {
+    x64: 'AMD64',
+    arm64: 'ARM64'
+  };
+  
+  const p = platMap[plat] || 'UNSPECIFIED';
+  const a = archMap[arch] || 'UNSPECIFIED';
+  const platform = `${p}_${a}`;
+
+  const traceId = randomUUID().replace(/-/g, '').slice(0, 16);
+  const trajectoryId = randomUUID();
+  const requestId = randomUUID();
+
+  const body = {
+    project: projectId,
+    requestId,
+    metadata: {
+      ideType: 'ANTIGRAVITY',
+      ideVersion: getAgyCliVersion(),
+      platform
+    },
+    metrics: [
+      {
+        timestamp: new Date().toISOString(),
+        conversationOffered: {
+          status: 'ACTION_STATUS_NO_ERROR',
+          traceId,
+          streamingLatency: {
+            firstMessageLatency: '0.5s',
+            totalLatency: '1.0s'
+          },
+          isAgentic: true,
+          initiationMethod: 'AGENT',
+          trajectoryId,
+          language: 'unspecified'
+        }
+      }
+    ]
+  };
+
+  const response = await agyFetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': userAgent,
+      Authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    console.warn(`[Agy] recordCodeAssistMetrics failed: ${response.status}`);
+  }
+}
+
+async function sendTrajectoryAnalytics(accessToken: string, userAgentModel?: string) {
+  const url = `${AGY_CODE_ASSIST_ENDPOINT}/v1internal:recordTrajectoryAnalytics`;
+  const userAgent = buildAgyCliUserAgent(userAgentModel);
+  
+  const plat = os.platform();
+  const arch = os.arch();
+  
+  const platMap: Record<string, string> = {
+    darwin: 'DARWIN',
+    linux: 'LINUX',
+    win32: 'WINDOWS'
+  };
+  const archMap: Record<string, string> = {
+    x64: 'AMD64',
+    arm64: 'ARM64'
+  };
+  
+  const p = platMap[plat] || 'UNSPECIFIED';
+  const a = archMap[arch] || 'UNSPECIFIED';
+  const platform = `${p}_${a}`;
+
+  const body = buildTrajectoryAnalyticsBody(randomUUID(), platform);
+
+  const response = await agyFetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': userAgent,
+      Authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    console.warn(`[Agy] recordTrajectoryAnalytics failed: ${response.status}`);
+  }
+}
+
+export function buildTrajectoryAnalyticsBody(cascadeId = randomUUID(), platform = 'DARWIN_AMD64') {
+  return {
+    trajectory: {
+      cascadeId,
+      executorMetadatas: [
+        {
+          cascadeConfig: {
+            agentApiConfig: {
+              enabled: false
+            },
+            checkpointConfig: {
+              checkpointModel: 'MODEL_PLACEHOLDER_M50',
+              strategy: 'CHECKPOINT_STRATEGY_SINGLE_PROMPT',
+              maxTokenLimit: '128000',
+              tokenThreshold: '50000',
+              maxOverheadRatio: '0.15',
+              movingWindowSize: '1',
+              enabled: true,
+              maxOutputTokens: '16384',
+              useLastPlannerModel: false,
+              isSync: false,
+              maxUserRequests: 10,
+              includeLastUserMessage: false,
+              includeConversationLog: true,
+              includeRunningTaskSnapshots: true,
+              includeSubagentSnapshots: true,
+              includeArtifactSnapshots: true,
+              retryConfig: {
+                maxRetries: 0,
+                initialSleepDurationMs: 1000,
+                exponentialMultiplier: 2,
+                includeErrorFeedback: false
+              }
+            }
+          }
+        }
+      ]
+    },
+    mendelExperimentIds: [],
+    metadata: {
+      ideType: 'ANTIGRAVITY',
+      ideVersion: getAgyCliVersion(),
+      platform
+    },
+    startStepIndex: '0'
+  };
+}

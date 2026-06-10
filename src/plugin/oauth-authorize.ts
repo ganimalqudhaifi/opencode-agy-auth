@@ -1,0 +1,161 @@
+import { spawn } from 'node:child_process';
+
+import { authorizeAgy, exchangeAgyWithVerifier } from '../sdk/oauth';
+import type { AgyTokenExchangeResult } from '../sdk/oauth';
+import { resolveProjectContextFromAccessToken } from './project';
+import { resolveConfiguredProjectId } from './provider';
+import { formatRefreshParts } from './auth';
+import type { OAuthAuthDetails, PluginClient } from './types';
+
+/**
+ * 构建用于插件认证方法的 OAuth 授权回调。
+ */
+export function createOAuthAuthorizeMethod(options?: {
+  client?: PluginClient;
+  getConfiguredProjectId?: () => Promise<string | undefined> | string | undefined;
+  getUserAgentModel?: () => Promise<string | undefined> | string | undefined;
+}): () => Promise<{
+  url: string;
+  instructions: string;
+  method: 'code';
+  callback: (callbackUrl: string) => Promise<AgyTokenExchangeResult>;
+}> {
+  return async () => {
+    const maybeHydrateProjectId = async (
+      result: AgyTokenExchangeResult
+    ): Promise<AgyTokenExchangeResult> => {
+      if (result.type !== 'success' || !result.access) {
+        return result;
+      }
+
+      const configuredProjectId = resolveConfiguredProjectId({
+        configProjectId: await options?.getConfiguredProjectId?.()
+      });
+
+      try {
+        const initialRefresh = formatRefreshParts({
+          refreshToken: result.refresh
+        });
+
+        const authSnapshot = {
+          type: 'oauth',
+          refresh: initialRefresh,
+          access: result.access,
+          expires: result.expires
+        } satisfies OAuthAuthDetails;
+
+        const projectContext = await resolveProjectContextFromAccessToken(
+          authSnapshot,
+          result.access,
+          configuredProjectId,
+          undefined,
+          await options?.getUserAgentModel?.()
+        );
+
+        return projectContext.auth.refresh !== initialRefresh
+          ? { ...result, refresh: projectContext.auth.refresh }
+          : { ...result, refresh: initialRefresh };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[OAuth] Project resolution skipped: ${message}`);
+        if (options?.client?.tui?.showToast) {
+          const message = error instanceof Error ? error.message : String(error);
+          options.client.tui.showToast({
+            body: {
+              title: "绑定项目上下文失败",
+              message: `已授权成功但无法绑定项目，将无法使用真实模型：${message}`,
+              variant: "warning",
+              duration: 15000
+            }
+          }).catch(() => {});
+        }
+        const initialRefresh = formatRefreshParts({
+          refreshToken: result.refresh
+        });
+        return { ...result, refresh: initialRefresh };
+      }
+    };
+
+    const isHeadless = !!(
+      process.env.SSH_CONNECTION ||
+      process.env.SSH_CLIENT ||
+      process.env.SSH_TTY ||
+      process.env.OPENCODE_HEADLESS
+    );
+
+    const authorization = await authorizeAgy();
+    if (!isHeadless) {
+      openBrowserUrl(authorization.url);
+    }
+
+    return {
+      url: authorization.url,
+      instructions:
+        '请在浏览器中完成 Google 账户授权。授权完成后，页面会跳转至 https://antigravity.google/oauth-callback?code=... 。请将最终浏览器地址栏的完整跳转 URL 或其中的 code 参数值复制并粘贴到下方输入框中：',
+      method: 'code',
+      callback: async (callbackUrl: string): Promise<AgyTokenExchangeResult> => {
+        try {
+          const { code, state } = parseOAuthCallbackInput(callbackUrl);
+          if (!code) {
+            return { type: 'failed', error: 'Missing authorization code in callback input' };
+          }
+          if (state && state !== authorization.state) {
+            return { type: 'failed', error: 'State mismatch in callback input (possible CSRF attempt)' };
+          }
+          const exchangeResult = await exchangeAgyWithVerifier(code, authorization.verifier);
+          return await maybeHydrateProjectId(exchangeResult);
+        } catch (error) {
+          return {
+            type: 'failed',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+      }
+    };
+  };
+}
+
+function parseOAuthCallbackInput(input: string): { code?: string; state?: string } {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return {};
+  }
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const url = new URL(trimmed);
+      return {
+        code: url.searchParams.get('code') || undefined,
+        state: url.searchParams.get('state') || undefined
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  const candidate = trimmed.startsWith('?') ? trimmed.slice(1) : trimmed;
+  if (candidate.includes('=')) {
+    const params = new URLSearchParams(candidate);
+    const code = params.get('code') || undefined;
+    const state = params.get('state') || undefined;
+    if (code || state) {
+      return { code, state };
+    }
+  }
+
+  return { code: trimmed };
+}
+
+function openBrowserUrl(url: string): void {
+  try {
+    const platform = process.platform;
+    const command =
+      platform === 'darwin' ? 'open' : platform === 'win32' ? 'rundll32' : 'xdg-open';
+    const args = platform === 'win32' ? ['url.dll,FileProtocolHandler', url] : [url];
+    const child = spawn(command, args, {
+      stdio: 'ignore',
+      detached: true
+    });
+    child.unref?.();
+  } catch {}
+}

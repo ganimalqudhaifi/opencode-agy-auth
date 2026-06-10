@@ -1,0 +1,526 @@
+import type { Config } from './plugin/types';
+import { AGY_PROVIDER_ID } from './constants';
+import { agyFetch } from './fetch';
+import { createOAuthAuthorizeMethod } from './plugin/oauth-authorize';
+import { accessTokenExpired, isOAuthAuth, parseRefreshParts } from './plugin/auth';
+import { resolveCachedAuth, initDiskSignatureCache } from './plugin/cache';
+import { ensureProjectContext, retrieveUserQuota } from './plugin/project';
+import { createAgyQuotaTool, AGY_QUOTA_TOOL_NAME } from './plugin/quota';
+import { maybeShowAgyCapacityToast, maybeShowAgyTestToast } from './plugin/notify';
+import { simulateClientBackgroundTraffic } from './plugin/traffic';
+import { buildAgyCliUserAgent } from './sdk/user-agent';
+import {
+  resolveConfiguredProjectId,
+  resolveConfiguredProjectIdFromClient,
+  resolveConfiguredProjectIdFromConfig
+} from './plugin/provider';
+import {
+  isGenerativeLanguageRequest,
+  parseGenerativeLanguageRequest,
+  prepareAgyRequest,
+  type ThinkingConfigDefaults,
+  transformAgyResponse
+} from './sdk/request';
+import { createChatLogger } from './sdk/chat-logger';
+import { fetchWithRetry } from './sdk/retry';
+import { refreshAccessToken } from './plugin/token';
+import type {
+  GetAuth,
+  OAuthAuthDetails,
+  PluginClient,
+  PluginContext,
+  PluginResult,
+  Provider,
+  ProviderModel,
+  ProviderV2
+} from './plugin/types';
+
+const AGY_QUOTA_COMMAND = 'agyquota';
+const AGY_QUOTA_COMMAND_TEMPLATE = `Retrieve Agy Code Assist quota usage for the current authenticated account.
+
+Immediately call \`${AGY_QUOTA_TOOL_NAME}\` with no arguments and return its output verbatim.
+Do not call other tools.
+`;
+let latestAgyAuthResolver: GetAuth | undefined;
+let latestAgyConfiguredProjectId: string | undefined;
+let latestAgyUserAgentModel: string | undefined;
+
+interface SimpleStaticModel {
+  name: string;
+  description: string;
+  maxTokens: number;
+  maxOutputTokens: number;
+  toolCall: boolean;
+  reasoning: boolean;
+  attachment: boolean;
+  cost?: {
+    input: number;
+    output: number;
+    cache?: { read: number; write: number };
+  };
+}
+
+const STATIC_MODELS_SIMPLE: Record<string, SimpleStaticModel> = {
+  'gemini-3.5-flash-low': {
+    name: 'Gemini 3.5 Flash (Medium)',
+    description: 'Gemini 3.5 Flash 中配版本，兼顾生成速度与推理性能，提供高性价比。',
+    maxTokens: 1048576,
+    maxOutputTokens: 65536,
+    toolCall: true,
+    reasoning: true,
+    attachment: true
+  },
+  'gemini-3-flash-agent': {
+    name: 'Gemini 3.5 Flash (High)',
+    description: 'Gemini 3.5 Flash 高配智能体版，响应极快，深度优化了多步骤工具调用与流程控制。',
+    maxTokens: 1048576,
+    maxOutputTokens: 65536,
+    toolCall: true,
+    reasoning: true,
+    attachment: true
+  },
+  'gemini-3.5-flash-extra-low': {
+    name: 'Gemini 3.5 Flash (Low)',
+    description: 'Gemini 3.5 Flash 超低配版本，适合大规模、低成本的简单文本处理任务。',
+    maxTokens: 1048576,
+    maxOutputTokens: 65536,
+    toolCall: true,
+    reasoning: true,
+    attachment: true
+  },
+  'gemini-3.1-pro-low': {
+    name: 'Gemini 3.1 Pro (Low)',
+    description: 'Gemini 3.1 Pro 低配版本，适合高复杂度的逻辑和代码编写任务，但限制了部分并发或配额。',
+    maxTokens: 1048576,
+    maxOutputTokens: 65535,
+    toolCall: true,
+    reasoning: true,
+    attachment: true
+  },
+  'gemini-pro-agent': {
+    name: 'Gemini 3.1 Pro (High)',
+    description:
+      'Gemini 3.1 Pro 高配/智能体版本，提供最先进的多模态理解与长文本推理能力，并针对智能体工具调用进行了优化。',
+    maxTokens: 1048576,
+    maxOutputTokens: 65535,
+    toolCall: true,
+    reasoning: true,
+    attachment: true
+  },
+  'claude-sonnet-4-6': {
+    name: 'Claude Sonnet 4.6 (Thinking)',
+    description: 'Claude Sonnet 4.6 深度推理模型，完美平衡了思考过程、处理速度与输出质量。',
+    maxTokens: 250000,
+    maxOutputTokens: 64000,
+    toolCall: true,
+    reasoning: true,
+    attachment: true
+  },
+  'claude-opus-4-6-thinking': {
+    name: 'Claude Opus 4.6 (Thinking)',
+    description: 'Claude Opus 4.6 深度推理模型，内置思考链，非常适合解决顶尖难度的算法和逻辑难题。',
+    maxTokens: 250000,
+    maxOutputTokens: 64000,
+    toolCall: true,
+    reasoning: true,
+    attachment: true
+  },
+  'gpt-oss-120b-medium': {
+    name: 'GPT-OSS 120B (Medium)',
+    description: 'GPT 开源 120B 参数中配模型，在本地化部署或特定开源基准上表现卓越。',
+    maxTokens: 131072,
+    maxOutputTokens: 32768,
+    toolCall: true,
+    reasoning: true,
+    attachment: false
+  }
+};
+
+const buildModelFromSimple = (modelId: string, simple: SimpleStaticModel): ProviderModel => {
+  const isClaude = modelId.startsWith('claude-');
+  const isGpt = modelId.startsWith('gpt-');
+  return {
+    id: modelId,
+    providerID: AGY_PROVIDER_ID,
+    api: {
+      id: AGY_PROVIDER_ID,
+      url: 'https://cloudcode-pa.googleapis.com',
+      npm: '@ai-sdk/google'
+    },
+    name: simple.name,
+    status: 'active',
+    release_date: '2026-05-26',
+    capabilities: {
+      temperature: true,
+      reasoning: simple.reasoning,
+      attachment: simple.attachment,
+      toolcall: simple.toolCall,
+      input: {
+        text: true,
+        image: simple.attachment,
+        pdf: simple.attachment,
+        audio: !isClaude && !isGpt,
+        video: !isClaude && !isGpt
+      },
+      output: {
+        text: true,
+        image: false,
+        pdf: false,
+        audio: false,
+        video: false
+      },
+      interleaved: false
+    },
+    cost: {
+      input: simple.cost?.input ?? 0,
+      output: simple.cost?.output ?? 0,
+      cache: {
+        read: simple.cost?.cache?.read ?? 0,
+        write: simple.cost?.cache?.write ?? 0
+      }
+    },
+    limit: {
+      context: simple.maxTokens,
+      output: simple.maxOutputTokens
+    },
+    options: {
+      description: simple.description
+    },
+    headers: {}
+  };
+};
+
+const STATIC_MODELS: Record<string, ProviderModel> = {};
+for (const [modelId, simple] of Object.entries(STATIC_MODELS_SIMPLE)) {
+  STATIC_MODELS[modelId] = buildModelFromSimple(modelId, simple);
+}
+
+/**
+ * 为 Opencode 注册 Agy OAuth 提供者。
+ */
+export const AgyCLIOAuthPlugin = async ({ client }: PluginContext): Promise<PluginResult> => {
+  let latestConfig: Config | undefined;
+
+  const getModelsList = (provider: ProviderV2): Record<string, ProviderModel> => {
+    provider.models = provider.models || {};
+    for (const [modelId, modelDetails] of Object.entries(STATIC_MODELS)) {
+      provider.models[modelId] = {
+        ...modelDetails,
+        ...(provider.models[modelId] || {})
+      };
+    }
+
+    if (latestConfig && latestConfig.provider && latestConfig.provider[AGY_PROVIDER_ID]) {
+      latestConfig.provider[AGY_PROVIDER_ID].models = STATIC_MODELS;
+    }
+    normalizeProviderModelCosts(provider);
+
+    return STATIC_MODELS;
+  };
+
+  initDiskSignatureCache({
+    enabled: true,
+    memory_ttl_seconds: 3600,
+    disk_ttl_seconds: 86400,
+    write_interval_seconds: 30
+  });
+
+  const resolveLatestConfiguredProjectId = async (provider?: Provider): Promise<string | undefined> => {
+    const configProjectId = (await resolveConfiguredProjectIdFromClient(client)) ?? latestAgyConfiguredProjectId;
+    const resolvedProjectId = resolveConfiguredProjectId({
+      provider,
+      configProjectId
+    });
+    latestAgyConfiguredProjectId = resolvedProjectId;
+    return resolvedProjectId;
+  };
+
+  return {
+    config: async (config) => {
+      latestConfig = config;
+      latestAgyConfiguredProjectId = resolveConfiguredProjectIdFromConfig(config);
+      config.command = config.command || {};
+      config.command[AGY_QUOTA_COMMAND] = {
+        description: 'Show Agy Code Assist quota usage',
+        template: AGY_QUOTA_COMMAND_TEMPLATE
+      };
+
+      // 动态注册 google-agy 提供商配置，使其无缝工作而无需用户手动映射
+      config.provider = config.provider || {};
+      config.provider[AGY_PROVIDER_ID] = {
+        npm: '@ai-sdk/google',
+        name: 'Antigravity CLI',
+        options: {},
+        models: {},
+        ...config.provider[AGY_PROVIDER_ID]
+      };
+
+      // 默认提供写死的静态模型列表
+      config.provider[AGY_PROVIDER_ID].models = STATIC_MODELS;
+    },
+    tool: {
+      [AGY_QUOTA_TOOL_NAME]: createAgyQuotaTool({
+        client,
+        getAuthResolver: () => latestAgyAuthResolver,
+        getConfiguredProjectId: () => latestAgyConfiguredProjectId,
+        getUserAgentModel: () => latestAgyUserAgentModel
+      })
+    },
+    auth: {
+      provider: AGY_PROVIDER_ID,
+      loader: async (getAuth: GetAuth, provider: Provider): Promise<any> => {
+        latestAgyAuthResolver = getAuth;
+        const auth = await getAuth();
+        if (!isOAuthAuth(auth)) {
+          return null;
+        }
+
+        const configuredProjectId = await resolveLatestConfiguredProjectId(provider);
+        normalizeProviderModelCosts(provider);
+        const thinkingConfigDefaults = resolveThinkingConfigDefaults(provider);
+
+        return {
+          apiKey: '',
+          async fetch(input: RequestInfo, init?: RequestInit) {
+            const isGL = isGenerativeLanguageRequest(input);
+            const isInternal = toUrlString(input).includes('cloudcode-pa.googleapis.com');
+
+            if (!isGL && !isInternal) {
+              return agyFetch(input, init);
+            }
+
+            const latestAuth = await getAuth();
+            if (!isOAuthAuth(latestAuth)) {
+              return agyFetch(input, init);
+            }
+
+            let authRecord = resolveCachedAuth(latestAuth);
+            if (accessTokenExpired(authRecord)) {
+              const refreshed = await refreshAccessToken(authRecord, client);
+              if (!refreshed) {
+                return agyFetch(input, init);
+              }
+              authRecord = refreshed;
+            }
+
+            if (!authRecord.access) {
+              return agyFetch(input, init);
+            }
+
+            const configuredProjectId = await resolveLatestConfiguredProjectId(provider);
+
+            if (isInternal) {
+              const headers = new Headers(init?.headers ?? {});
+              const hasAuth =
+                headers.has('Authorization') ||
+                Object.keys(init?.headers ?? {}).some((k) => k.toLowerCase() === 'authorization');
+              if (hasAuth) {
+                return agyFetch(input, init);
+              }
+
+              headers.set('Authorization', `Bearer ${authRecord.access}`);
+              const userAgent = buildAgyCliUserAgent(latestAgyUserAgentModel);
+              headers.set('User-Agent', userAgent);
+
+              if (configuredProjectId) {
+                simulateClientBackgroundTraffic(authRecord.access, configuredProjectId, latestAgyUserAgentModel);
+              }
+
+              return agyFetch(input, {
+                ...init,
+                headers
+              });
+            }
+            const requestTarget = parseGenerativeLanguageRequest(input);
+            const requestUserAgentModel = requestTarget?.effectiveModel;
+            if (requestUserAgentModel) {
+              latestAgyUserAgentModel = requestUserAgentModel;
+            }
+            const projectContext = await ensureProjectContextOrThrow(
+              authRecord,
+              client,
+              configuredProjectId,
+              requestUserAgentModel
+            );
+            await maybeShowAgyTestToast(client, projectContext.effectiveProjectId);
+
+            const parts = parseRefreshParts(authRecord.refresh);
+            const transformed = prepareAgyRequest(
+              input,
+              init,
+              authRecord.access,
+              projectContext.effectiveProjectId,
+              thinkingConfigDefaults
+            );
+            const chatLogger = createChatLogger();
+            if (chatLogger) {
+              chatLogger.logRequest(
+                toUrlString(transformed.request),
+                transformed.init.method || 'GET',
+                transformed.init.headers,
+                transformed.init.body
+              );
+            }
+
+            const response = await fetchWithRetry(transformed.request, transformed.init);
+            if (response.ok && authRecord.access && projectContext.effectiveProjectId) {
+              simulateClientBackgroundTraffic(
+                authRecord.access,
+                projectContext.effectiveProjectId,
+                requestUserAgentModel
+              );
+            }
+            await maybeShowAgyCapacityToast(
+              client,
+              response,
+              projectContext.effectiveProjectId,
+              transformed.requestedModel
+            );
+            return transformAgyResponse(
+              response,
+              transformed.streaming,
+              null,
+              transformed.requestedModel,
+              transformed.sessionId,
+              chatLogger
+            );
+          }
+        };
+      },
+      methods: [
+        {
+          label: 'Google OAuth (Antigravity CLI)',
+          type: 'oauth',
+          authorize: createOAuthAuthorizeMethod({
+            client,
+            getConfiguredProjectId: () => resolveLatestConfiguredProjectId(),
+            getUserAgentModel: () => latestAgyUserAgentModel
+          })
+        },
+        {
+          label: 'Manually enter API Key',
+          type: 'api'
+        }
+      ]
+    },
+    provider: {
+      id: AGY_PROVIDER_ID,
+      models: async (provider: any, ctx: any): Promise<any> => {
+        let auth = ctx?.auth;
+        if (!auth && latestAgyAuthResolver) {
+          try {
+            auth = await latestAgyAuthResolver();
+          } catch (e) {
+            const errStr = e instanceof Error ? e.stack || e.message : String(e);
+            console.warn(`[Agy Auth] Failed to resolve auth from resolver in models hook: ${errStr}`);
+          }
+        }
+
+        if (!auth || !isOAuthAuth(auth)) {
+          return {
+            'login-required': {
+              name: '暂无模型列表'
+            }
+          };
+        }
+
+        return getModelsList(provider);
+      }
+    } as any
+  };
+};
+
+export const GoogleOAuthPlugin = AgyCLIOAuthPlugin;
+
+function normalizeProviderModelCosts(provider: Provider | ProviderV2): void {
+  if (!provider?.models || typeof provider.models !== 'object') {
+    return;
+  }
+  for (const [modelId, model] of Object.entries(provider.models)) {
+    if (!model || typeof model !== 'object') {
+      continue;
+    }
+    const existingCost = model.cost;
+    const isValidCost =
+      existingCost &&
+      typeof existingCost === 'object' &&
+      typeof existingCost.input === 'number' &&
+      typeof existingCost.output === 'number';
+    const normalizedCost = {
+      input: isValidCost ? existingCost.input : 0,
+      output: isValidCost ? existingCost.output : 0,
+      cache: {
+        read:
+          isValidCost &&
+          typeof existingCost.cache === 'object' &&
+          existingCost.cache !== null &&
+          typeof (existingCost.cache as { read?: number }).read === 'number'
+            ? (existingCost.cache as { read: number }).read
+            : 0,
+        write:
+          isValidCost &&
+          typeof existingCost.cache === 'object' &&
+          existingCost.cache !== null &&
+          typeof (existingCost.cache as { write?: number }).write === 'number'
+            ? (existingCost.cache as { write: number }).write
+            : 0
+      }
+    };
+    model.cost = normalizedCost;
+  }
+}
+
+function resolveThinkingConfigDefaults(provider: Provider): ThinkingConfigDefaults | undefined {
+  const providerOptions =
+    provider && typeof provider === 'object'
+      ? ((provider as { options?: Record<string, unknown> }).options ?? undefined)
+      : undefined;
+  const providerThinkingConfig = providerOptions?.thinkingConfig;
+
+  const modelThinkingConfigByModel: Record<string, unknown> = {};
+  for (const [modelId, model] of Object.entries(provider.models ?? {})) {
+    if (!model || typeof model !== 'object') {
+      continue;
+    }
+    const modelOptions = (model as { options?: Record<string, unknown> }).options;
+    if (modelOptions && typeof modelOptions === 'object' && 'thinkingConfig' in modelOptions) {
+      modelThinkingConfigByModel[modelId] = modelOptions.thinkingConfig;
+    }
+  }
+
+  if (providerThinkingConfig === undefined && Object.keys(modelThinkingConfigByModel).length === 0) {
+    return undefined;
+  }
+
+  return {
+    provider: providerThinkingConfig,
+    models: modelThinkingConfigByModel
+  };
+}
+
+async function ensureProjectContextOrThrow(
+  authRecord: OAuthAuthDetails,
+  client: PluginClient,
+  configuredProjectId?: string,
+  userAgentModel?: string
+) {
+  try {
+    return await ensureProjectContext(authRecord, client, configuredProjectId, userAgentModel);
+  } catch (error) {
+    if (error instanceof Error) {
+      console.warn(`[Agy Auth] ensureProjectContextOrThrow error: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+function toUrlString(value: RequestInfo): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  const candidate = (value as Request).url;
+  if (candidate) {
+    return candidate;
+  }
+  return value.toString();
+}
