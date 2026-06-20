@@ -512,6 +512,9 @@ export function deduplicateThinkingText(
     });
 
     const filteredContent = newContent.filter((b) => b !== null);
+    if (filteredContent.length === 0) {
+      return { ...resp, content: [] };
+    }
     return { ...resp, content: filteredContent };
   }
 
@@ -709,12 +712,17 @@ export function createStreamingTransformer(
       if (!hasSeenUsageMetadata) {
         const syntheticUsage = {
           response: {
+            candidates: [
+              {
+                finishReason: "STOP",
+              },
+            ],
             usageMetadata: {
               promptTokenCount: 0,
               candidatesTokenCount: 0,
               totalTokenCount: 0,
-            }
-          }
+            },
+          },
         };
         controller.enqueue(encoder.encode(`\ndata: ${JSON.stringify(syntheticUsage)}\n\n`));
       }
