@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { AGY_CODE_ASSIST_ENDPOINT } from "../../constants";
+import modelsJson from "../../../models.json";
 import { normalizeThinkingConfig } from "../request-helpers";
 import { buildAgyCliUserAgent } from "../user-agent";
 import { normalizeRequestPayloadIdentifiers, normalizeWrappedIdentifiers } from "./identifiers";
@@ -104,6 +105,18 @@ export function prepareAgyRequest(
   };
 }
 
+function getModelEnum(modelName: string): string {
+  const models = (modelsJson as any).models;
+  if (models && models[modelName] && models[modelName].model) {
+    return models[modelName].model;
+  }
+  const deprecated = (modelsJson as any).deprecatedModelIds;
+  if (deprecated && deprecated[modelName] && deprecated[modelName].oldModelEnum) {
+    return deprecated[modelName].oldModelEnum;
+  }
+  return "MODEL_PLACEHOLDER_M16";
+}
+
 function transformRequestBody(
   body: string,
   projectId: string,
@@ -142,7 +155,7 @@ function transformRequestBody(
         requestPayloadInside.labels = {
           last_execution_id: randomUUID(),
           last_step_index: "0",
-          model_enum: "MODEL_PLACEHOLDER_M16",
+          model_enum: getModelEnum(effectiveModel),
           trajectory_id: randomUUID(),
           used_claude: "false",
           used_claude_conservative: "false"
@@ -154,13 +167,16 @@ function transformRequestBody(
       }
       if (requestPayloadInside && Array.isArray(requestPayloadInside.contents)) {
         let contents = requestPayloadInside.contents;
+
+        injectMissingToolCallIds(contents);
+        fixOrphanedFunctionResponses(contents);
+
         const state = analyzeConversationState(contents);
         if (needsThinkingRecovery(state)) {
           contents = closeToolLoopForThinking(contents);
         }
 
         contents = normalizeContentsSequence(contents);
-        injectMissingToolCallIds(contents);
 
         const latestSig = getLatestSignature(sessionId);
         applyLatestSignature(contents, latestSig);
@@ -188,13 +204,15 @@ function transformRequestBody(
 
     let contents = requestPayload.contents as any[];
     if (Array.isArray(contents)) {
+      injectMissingToolCallIds(contents);
+      fixOrphanedFunctionResponses(contents);
+
       const state = analyzeConversationState(contents);
       if (needsThinkingRecovery(state)) {
         contents = closeToolLoopForThinking(contents);
       }
 
       contents = normalizeContentsSequence(contents);
-      injectMissingToolCallIds(contents);
 
       const latestSig = getLatestSignature(sessionId);
       applyLatestSignature(contents, latestSig);
@@ -209,7 +227,7 @@ function transformRequestBody(
       requestPayload.labels = {
         last_execution_id: randomUUID(),
         last_step_index: "0",
-        model_enum: "MODEL_PLACEHOLDER_M16",
+        model_enum: getModelEnum(effectiveModel),
         trajectory_id: randomUUID(),
         used_claude: "false",
         used_claude_conservative: "false"
@@ -513,6 +531,46 @@ function applyLatestSignature(contents: any[], latestSig: string | undefined): v
     const lastFunctionCall = allFunctionCalls[allFunctionCalls.length - 1];
     if (!lastFunctionCall.thoughtSignature || lastFunctionCall.thoughtSignature === "skip_thought_signature_validator") {
       lastFunctionCall.thoughtSignature = latestSig;
+    }
+  }
+}
+
+function fixOrphanedFunctionResponses(contents: any[]): void {
+  const validCallIds = new Set<string>();
+
+  for (const content of contents) {
+    if (!content || typeof content !== "object" || !Array.isArray(content.parts)) {
+      continue;
+    }
+    for (const part of content.parts) {
+      if (part && typeof part === "object" && part.functionCall && part.functionCall.id) {
+        validCallIds.add(part.functionCall.id);
+      }
+    }
+  }
+
+  for (const content of contents) {
+    if (!content || typeof content !== "object" || !Array.isArray(content.parts)) {
+      continue;
+    }
+    for (const part of content.parts) {
+      if (part && typeof part === "object" && part.functionResponse) {
+        const id = part.functionResponse.id;
+        if (!id || !validCallIds.has(id)) {
+          const name = part.functionResponse.name || "unknown_tool";
+          const responseObj = part.functionResponse.response || {};
+
+          let responseStr = "";
+          try {
+            responseStr = typeof responseObj === "string" ? responseObj : JSON.stringify(responseObj);
+          } catch (e) {
+            responseStr = String(responseObj);
+          }
+
+          part.text = `[Orphaned Tool Response for ${name}]: ${responseStr}`;
+          delete part.functionResponse;
+        }
+      }
     }
   }
 }
