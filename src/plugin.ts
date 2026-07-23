@@ -1,3 +1,4 @@
+import { updateStaticModelsWithPricing } from './plugin/pricing';
 import type { Config } from './plugin/types';
 import { AGY_PROVIDER_ID } from './constants';
 import { agyFetch } from './fetch';
@@ -312,6 +313,9 @@ function resolveModelTier(baseModelId: string, init?: RequestInit): string {
  */
 export const AgyCLIOAuthPlugin = async ({ client }: PluginContext): Promise<PluginResult> => {
   let latestConfig: Config | undefined;
+
+  // Dynamically update STATIC_MODELS with latest pricing from models.dev
+  await updateStaticModelsWithPricing(STATIC_MODELS);
 
   const getModelsList = (provider: ProviderV2): Record<string, ProviderModel> => {
     provider.models = provider.models || {};
