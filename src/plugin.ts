@@ -328,7 +328,8 @@ export const AgyCLIOAuthPlugin = async ({ client }: PluginContext): Promise<Plug
 
   const getModelsList = (provider: ProviderV2): Record<string, ProviderModel> => {
     provider.models = provider.models || {};
-    for (const [modelId, modelDetails] of Object.entries(STATIC_MODELS)) {
+    const clonedStaticModels = JSON.parse(JSON.stringify(STATIC_MODELS));
+    for (const [modelId, modelDetails] of Object.entries(clonedStaticModels as Record<string, ProviderModel>)) {
       const existing = (provider.models[modelId] || {}) as Partial<ProviderModel>;
       provider.models[modelId] = {
         ...modelDetails,
@@ -357,11 +358,11 @@ export const AgyCLIOAuthPlugin = async ({ client }: PluginContext): Promise<Plug
     }
 
     if (latestConfig && latestConfig.provider && latestConfig.provider[AGY_PROVIDER_ID]) {
-      latestConfig.provider[AGY_PROVIDER_ID].models = STATIC_MODELS;
+      latestConfig.provider[AGY_PROVIDER_ID].models = provider.models;
     }
     normalizeProviderModelCosts(provider);
 
-    return STATIC_MODELS;
+    return provider.models;
   };
 
   try {
@@ -422,7 +423,7 @@ export const AgyCLIOAuthPlugin = async ({ client }: PluginContext): Promise<Plug
       };
 
       // Provides a hardcoded static model list by default.
-      config.provider[AGY_PROVIDER_ID].models = STATIC_MODELS;
+      config.provider[AGY_PROVIDER_ID].models = JSON.parse(JSON.stringify(STATIC_MODELS));
     },
     tool: {
       [AGY_QUOTA_TOOL_NAME]: createAgyQuotaTool({
