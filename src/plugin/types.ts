@@ -36,5 +36,34 @@ export interface ProjectContextResult {
   effectiveProjectId: string;
 }
 
+export type ModelFamily = 'claude' | 'gemini';
+
+export interface ManagedAccount {
+  index: number;
+  email?: string;
+  addedAt: number;
+  lastUsed: number;
+  parts: RefreshParts;
+  access?: string;
+  expires?: number;
+  enabled: boolean;
+  rateLimitResetTimes: Partial<Record<ModelFamily, number>>;
+}
+
+export interface AccountStorageSchema {
+  version: 1;
+  accounts: Array<{
+    email?: string;
+    refreshToken: string;
+    projectId?: string;
+    managedProjectId?: string;
+    addedAt: number;
+    lastUsed: number;
+    enabled: boolean;
+    rateLimitResetTimes?: Partial<Record<ModelFamily, number>>;
+  }>;
+  activeIndexByFamily?: Partial<Record<ModelFamily, number>>;
+}
+
 // Export V2 types explicitly for use in provider hooks
 export type { Provider as ProviderV2, Model as ModelV2 } from '@opencode-ai/sdk/v2';

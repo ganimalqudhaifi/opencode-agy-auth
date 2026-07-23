@@ -11,16 +11,21 @@ interface CooldownData {
 const WRITE_THROTTLE_MS = 5000;
 
 function getConfigDir(): string {
-  const platform = process.platform;
-  if (platform === "win32") {
-    return join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "opencode");
-  }
   const xdgConfig = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
   return join(xdgConfig, "opencode");
 }
 
 function getCooldownFilePath(): string {
-  return join(getConfigDir(), "antigravity-retry-cooldowns.json");
+  const oldPath = join(getConfigDir(), "antigravity-retry-cooldowns.json");
+  const newDir = join(getConfigDir(), "agy");
+  const newPath = join(newDir, "retry-cooldowns.json");
+  
+  if (existsSync(oldPath) && !existsSync(newPath)) {
+    if (!existsSync(newDir)) mkdirSync(newDir, { recursive: true });
+    renameSync(oldPath, newPath);
+  }
+  
+  return newPath;
 }
 
 export function loadCooldowns(): Map<string, number> {

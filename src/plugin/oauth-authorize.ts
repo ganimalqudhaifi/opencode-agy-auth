@@ -6,6 +6,8 @@ import { resolveProjectContextFromAccessToken } from './project';
 import { resolveConfiguredProjectId } from './provider';
 import { formatRefreshParts } from './auth';
 import type { OAuthAuthDetails, PluginClient } from './types';
+import { AccountManager } from './accounts';
+import { isTTY, showAccountDetails, showAuthMenu, type AccountInfo } from './ui/auth-menu';
 
 
 /**
@@ -22,6 +24,114 @@ export function createOAuthAuthorizeMethod(options?: {
   callback: (callbackUrl: string) => Promise<AgyTokenExchangeResult>;
 }> {
   return async () => {
+    // If TTY terminal is active and pool has existing accounts, display interactive menu first
+    if (isTTY()) {
+      try {
+        const accountMgr = await AccountManager.getInstance();
+        const poolAccounts = accountMgr.getAccounts();
+
+        if (poolAccounts.length > 0) {
+          const now = Date.now();
+          const accountInfos: AccountInfo[] = poolAccounts.map((acc) => {
+            const isLimited = Object.values(acc.rateLimitResetTimes).some(
+              (resetTime) => typeof resetTime === 'number' && resetTime > now
+            );
+            return {
+              email: acc.email,
+              index: acc.index,
+              addedAt: acc.addedAt,
+              lastUsed: acc.lastUsed,
+              status: !acc.enabled ? 'disabled' : isLimited ? 'rate-limited' : 'active',
+              enabled: acc.enabled !== false,
+              isCurrentAccount: acc.index === 0
+            };
+          });
+
+          let menuDone = false;
+          while (!menuDone) {
+            const action = await showAuthMenu(accountInfos);
+
+            if (action.type === 'cancel') {
+              menuDone = true;
+            } else if (action.type === 'add') {
+              menuDone = true; // Proceed to browser OAuth flow below
+            } else if (action.type === 'delete-all') {
+              for (const acc of [...accountMgr.getAccounts()]) {
+                accountMgr.disableAccount(acc.index);
+              }
+              accountMgr.saveToDisk();
+              console.log('\n✅ All accounts cleared from pool.\n');
+              menuDone = true;
+            } else if (action.type === 'check') {
+              process.stdout.write('\x1b[2J\x1b[1;1H');
+              console.log('📊 Account Pool Summary:');
+              console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+              for (const acc of accountMgr.getAccounts()) {
+                const label = acc.email || `Account #${acc.index + 1}`;
+                const disabledStr = acc.enabled ? ' \x1b[32m(Active)\x1b[0m' : ' \x1b[31m(Disabled)\x1b[0m';
+                console.log(` • ${label}${disabledStr}`);
+
+                const claudeReset = acc.rateLimitResetTimes.claude;
+                const geminiReset = acc.rateLimitResetTimes.gemini;
+                const now = Date.now();
+
+                const claudeStatus = claudeReset && claudeReset > now
+                  ? `\x1b[33mRate-Limited (resets in ${Math.ceil((claudeReset - now) / 60000)}m)\x1b[0m`
+                  : '\x1b[32mReady\x1b[0m';
+
+                const geminiStatus = geminiReset && geminiReset > now
+                  ? `\x1b[33mRate-Limited (resets in ${Math.ceil((geminiReset - now) / 60000)}m)\x1b[0m`
+                  : '\x1b[32mReady\x1b[0m';
+
+                console.log(`   ├─ Claude status: ${claudeStatus}`);
+                console.log(`   └─ Gemini status: ${geminiStatus}`);
+              }
+              console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+              console.log('\nPress Enter to return to menu...');
+              await new Promise<void>((resolve) => {
+                const stdin = process.stdin;
+                const wasRaw = stdin.isRaw ?? false;
+                const onData = () => {
+                  try {
+                    stdin.removeListener('data', onData);
+                    stdin.setRawMode(wasRaw);
+                    stdin.pause();
+                  } catch {}
+                  resolve();
+                };
+                try {
+                  stdin.setRawMode(true);
+                  stdin.resume();
+                  stdin.once('data', onData);
+                } catch {
+                  resolve();
+                }
+              });
+            } else if (action.type === 'select-account') {
+              const detailsAction = await showAccountDetails(action.account);
+              if (detailsAction === 'delete') {
+                accountMgr.disableAccount(action.account.index);
+                console.log(`\n✅ Account #${action.account.index + 1} disabled/removed.\n`);
+              } else if (detailsAction === 'toggle') {
+                const newStatus = !action.account.enabled;
+                if (newStatus) {
+                  const acc = accountMgr.getAccounts()[action.account.index];
+                  if (acc) acc.enabled = true;
+                  accountMgr.saveToDisk();
+                } else {
+                  accountMgr.disableAccount(action.account.index);
+                }
+              } else if (detailsAction === 'refresh') {
+                menuDone = true; // Re-authenticate via browser OAuth
+              }
+            }
+          }
+        }
+      } catch (uiErr) {
+        console.warn(`[Agy Auth] TUI menu skipped: ${uiErr instanceof Error ? uiErr.message : String(uiErr)}`);
+      }
+    }
+
     const maybeHydrateProjectId = async (
       result: AgyTokenExchangeResult
     ): Promise<AgyTokenExchangeResult> => {
@@ -32,6 +142,8 @@ export function createOAuthAuthorizeMethod(options?: {
       const configuredProjectId = resolveConfiguredProjectId({
         configProjectId: await options?.getConfiguredProjectId?.()
       });
+
+      let finalResult: AgyTokenExchangeResult = result;
 
       try {
         const initialRefresh = formatRefreshParts({
@@ -53,7 +165,7 @@ export function createOAuthAuthorizeMethod(options?: {
           await options?.getUserAgentModel?.()
         );
 
-        return projectContext.auth.refresh !== initialRefresh
+        finalResult = projectContext.auth.refresh !== initialRefresh
           ? { ...result, refresh: projectContext.auth.refresh }
           : { ...result, refresh: initialRefresh };
       } catch (error) {
@@ -73,8 +185,45 @@ export function createOAuthAuthorizeMethod(options?: {
         const initialRefresh = formatRefreshParts({
           refreshToken: result.refresh
         });
-        return { ...result, refresh: initialRefresh };
+        finalResult = { ...result, refresh: initialRefresh };
       }
+
+      // Store/append account to multi-account pool
+      if (finalResult.type === 'success' && finalResult.access) {
+        try {
+          const accountMgr = await AccountManager.getInstance();
+          const savedAccount = accountMgr.addOrUpdateAccount(
+            {
+              type: 'oauth',
+              refresh: finalResult.refresh,
+              access: finalResult.access,
+              expires: finalResult.expires
+            },
+            finalResult.email
+          );
+
+          const poolSize = accountMgr.getAccounts().length;
+          const accountLabel = savedAccount?.email || `Account #${(savedAccount?.index ?? 0) + 1}`;
+          console.warn(
+            `[Agy Auth] Account ${accountLabel} successfully saved to pool. Total accounts in pool: ${poolSize}`
+          );
+
+          if (options?.client?.tui?.showToast) {
+            options.client.tui.showToast({
+              body: {
+                title: "Account Added to Pool",
+                message: `${accountLabel} added successfully! Pool size: ${poolSize} account(s).`,
+                variant: "info",
+                duration: 5000
+              }
+            }).catch(() => {});
+          }
+        } catch (poolErr) {
+          console.warn(`[Agy Auth] Failed to save account to pool: ${poolErr instanceof Error ? poolErr.message : String(poolErr)}`);
+        }
+      }
+
+      return finalResult;
     };
 
     const isHeadless = !!(

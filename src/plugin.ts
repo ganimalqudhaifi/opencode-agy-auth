@@ -9,6 +9,8 @@ import { initCooldownPersistence } from './sdk/retry';
 import { ensureProjectContext, retrieveUserQuota, retrieveUserQuotaSummary } from './plugin/project';
 import { createAgyQuotaTool, AGY_QUOTA_TOOL_NAME } from './plugin/quota';
 import { createAgyQuotaSummaryTool, AGY_QUOTA_SUMMARY_TOOL_NAME } from './plugin/quota-summary';
+import { createAgySwitchTool, AGY_SWITCH_TOOL_NAME } from './plugin/switch-tool';
+import { AccountManager, detectModelFamily } from './plugin/accounts';
 import { maybeShowAgyCapacityToast, maybeShowAgyTestToast } from './plugin/notify';
 import { simulateClientBackgroundTraffic } from './plugin/traffic';
 import { buildAgyCliUserAgent } from './sdk/user-agent';
@@ -49,6 +51,13 @@ const AGY_QUOTA_SUMMARY_COMMAND = 'agyquotasummary';
 const AGY_QUOTA_SUMMARY_COMMAND_TEMPLATE = `Retrieve Agy Code Assist quota summary (weekly and 5-hour limits by model group) for the current authenticated account.
 
 Immediately call \`${AGY_QUOTA_SUMMARY_TOOL_NAME}\` with no arguments and return its output verbatim.
+Do not call other tools.
+`;
+
+const AGY_SWITCH_COMMAND = 'agyswitch';
+const AGY_SWITCH_COMMAND_TEMPLATE = `List or switch active accounts in the Antigravity multi-account pool.
+
+Immediately call \`${AGY_SWITCH_TOOL_NAME}\` with no arguments (or accountIndex if specified) and return its output verbatim.
 Do not call other tools.
 `;
 let latestAgyAuthResolver: GetAuth | undefined;
@@ -376,6 +385,10 @@ export const AgyCLIOAuthPlugin = async ({ client }: PluginContext): Promise<Plug
         description: 'Show Agy Code Assist quota summary with weekly and 5-hour limits',
         template: AGY_QUOTA_SUMMARY_COMMAND_TEMPLATE
       };
+      config.command[AGY_SWITCH_COMMAND] = {
+        description: 'List or switch active accounts in the Antigravity multi-account pool',
+        template: AGY_SWITCH_COMMAND_TEMPLATE
+      };
 
       // Dynamically registers the google-agy provider config to make it work seamlessly without manual user mapping.
       config.provider = config.provider || {};
@@ -402,7 +415,8 @@ export const AgyCLIOAuthPlugin = async ({ client }: PluginContext): Promise<Plug
         getAuthResolver: () => latestAgyAuthResolver,
         getConfiguredProjectId: () => latestAgyConfiguredProjectId,
         getUserAgentModel: () => latestAgyUserAgentModel
-      })
+      }),
+      [AGY_SWITCH_TOOL_NAME]: createAgySwitchTool()
     },
     auth: {
       provider: AGY_PROVIDER_ID,
@@ -473,13 +487,24 @@ export const AgyCLIOAuthPlugin = async ({ client }: PluginContext): Promise<Plug
             if (requestUserAgentModel) {
               latestAgyUserAgentModel = requestUserAgentModel;
             }
-            const projectContext = await ensureProjectContextOrThrow(
-              authRecord,
-              client,
-              configuredProjectId,
-              requestUserAgentModel
-            );
-            await maybeShowAgyTestToast(client, projectContext.effectiveProjectId);
+
+            const modelFamily = detectModelFamily(requestUserAgentModel);
+            const accountMgr = await AccountManager.getInstance(authRecord);
+            let activeManagedAccount = accountMgr.getCurrentAccountForFamily(modelFamily);
+
+            if (activeManagedAccount) {
+              const accountAuth = accountMgr.toAuthDetails(activeManagedAccount);
+              let resolvedAccountAuth = resolveCachedAuth(accountAuth);
+              if (accessTokenExpired(resolvedAccountAuth)) {
+                const refreshed = await refreshAccessToken(resolvedAccountAuth, client);
+                if (refreshed) {
+                  resolvedAccountAuth = refreshed;
+                }
+              }
+              if (resolvedAccountAuth.access) {
+                authRecord = resolvedAccountAuth;
+              }
+            }
 
             const originalRequestedModel = parseGenerativeLanguageRequest(input)?.effectiveModel;
             let modifiedInput = input;
@@ -487,54 +512,109 @@ export const AgyCLIOAuthPlugin = async ({ client }: PluginContext): Promise<Plug
                const originalBase = originalRequestedModel.replace('google-agy/', '');
                const resolvedBase = resolveModelTier(originalBase, init);
                if (originalBase !== resolvedBase) {
-                 if (typeof modifiedInput === 'string') {
-                    modifiedInput = modifiedInput.replace(`models/${originalBase}`, `models/${resolvedBase}`);
-                 } else if (typeof Request !== 'undefined' && modifiedInput instanceof Request) {
-                    const newUrl = modifiedInput.url.replace(`models/${originalBase}`, `models/${resolvedBase}`);
-                    modifiedInput = new Request(newUrl, modifiedInput);
-                 }
+                  if (typeof modifiedInput === 'string') {
+                     modifiedInput = modifiedInput.replace(`models/${originalBase}`, `models/${resolvedBase}`);
+                  } else if (typeof Request !== 'undefined' && modifiedInput instanceof Request) {
+                     const newUrl = modifiedInput.url.replace(`models/${originalBase}`, `models/${resolvedBase}`);
+                     modifiedInput = new Request(newUrl, modifiedInput);
+                  }
                }
             }
 
-            const parts = parseRefreshParts(authRecord.refresh);
-            const transformed = prepareAgyRequest(
-              modifiedInput,
-              init,
-              authRecord.access,
-              projectContext.effectiveProjectId,
-              thinkingConfigDefaults
-            );
-            const chatLogger = createChatLogger();
-            if (chatLogger) {
-              chatLogger.logRequest(
-                toUrlString(transformed.request),
-                transformed.init.method || 'GET',
-                transformed.init.headers,
-                transformed.init.body
-              );
-            }
+            const totalAccountsInPool = Math.max(1, accountMgr.getEnabledAccounts().length);
+            let attempts = 0;
+            let response: Response | undefined;
+            let finalProjectContext: any;
+            let finalTransformed: any;
+            let finalChatLogger: ReturnType<typeof createChatLogger> | null = null;
 
-            const response = await fetchWithRetry(transformed.request, transformed.init);
-            if (response.ok && authRecord.access && projectContext.effectiveProjectId) {
-              simulateClientBackgroundTraffic(
+            while (attempts < totalAccountsInPool) {
+              attempts += 1;
+
+              const projectContext = await ensureProjectContextOrThrow(
+                authRecord,
+                client,
+                configuredProjectId,
+                requestUserAgentModel
+              );
+              finalProjectContext = projectContext;
+              await maybeShowAgyTestToast(client, projectContext.effectiveProjectId);
+
+              const transformed = prepareAgyRequest(
+                modifiedInput,
+                init,
                 authRecord.access,
                 projectContext.effectiveProjectId,
+                thinkingConfigDefaults
+              );
+              finalTransformed = transformed;
+
+              const chatLogger = createChatLogger();
+              finalChatLogger = chatLogger;
+              if (chatLogger) {
+                chatLogger.logRequest(
+                  toUrlString(transformed.request),
+                  transformed.init.method || 'GET',
+                  transformed.init.headers,
+                  transformed.init.body
+                );
+              }
+
+              response = await fetchWithRetry(transformed.request, transformed.init);
+
+              if ((response.status === 429 || response.status === 503) && activeManagedAccount) {
+                const cooldownMs = modelFamily === 'claude' ? 5 * 3600 * 1000 : 60 * 1000;
+                const nextAccount = accountMgr.markRateLimited(activeManagedAccount.index, modelFamily, cooldownMs);
+
+                if (nextAccount && nextAccount.index !== activeManagedAccount.index) {
+                  activeManagedAccount = nextAccount;
+                  let nextAuth = accountMgr.toAuthDetails(nextAccount);
+                  if (accessTokenExpired(nextAuth)) {
+                    const refreshedNext = await refreshAccessToken(nextAuth, client);
+                    if (refreshedNext) {
+                      nextAuth = refreshedNext;
+                    }
+                  }
+                  if (nextAuth.access) {
+                    authRecord = nextAuth;
+                    continue;
+                  }
+                }
+              }
+
+              break;
+            }
+
+            if (!response) {
+              return agyFetch(input, init);
+            }
+
+            if (response.ok && activeManagedAccount) {
+              accountMgr.markAccountUsed(activeManagedAccount.index);
+            }
+
+            if (response.ok && authRecord.access && finalProjectContext?.effectiveProjectId) {
+              simulateClientBackgroundTraffic(
+                authRecord.access,
+                finalProjectContext.effectiveProjectId,
                 requestUserAgentModel
               );
             }
+
             await maybeShowAgyCapacityToast(
               client,
               response,
-              projectContext.effectiveProjectId,
-              transformed.requestedModel
+              finalProjectContext?.effectiveProjectId,
+              finalTransformed?.requestedModel
             );
+
             return transformAgyResponse(
               response,
-              transformed.streaming,
+              finalTransformed?.streaming,
               null,
-              transformed.requestedModel,
-              transformed.sessionId,
-              chatLogger
+              finalTransformed?.requestedModel,
+              finalTransformed?.sessionId,
+              finalChatLogger
             );
           }
         };
