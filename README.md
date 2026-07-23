@@ -6,7 +6,8 @@ An [OpenCode](https://opencode.ai/) authentication plugin that enables seamless 
 
 - **OAuth 2.0 Integration**: Uses Antigravity's OAuth flows for authentication.
 - **Dynamic Model Retrieval**: Fetches available models based on user tier and current allocations.
-- **Quota Tracking**: Injects the `agy_quota` tool into OpenCode to check usage limits directly.
+- **Multi-Account Pool & Sticky Rotation**: Automatically switches between multiple accounts if one hits a rate limit or exhausts its quota, keeping your OpenCode session alive.
+- **Quota Tracking**: Injects tools into OpenCode to check usage limits directly.
 - **Traffic Simulation**: Maintains background heartbeat with `agy` servers.
 
 ## Installation
@@ -19,30 +20,24 @@ npm install @anthonyhaussman/opencode-agy-auth
 
 ## Configuration
 
-Update your OpenCode configuration file (typically `opencode.json` at the root of your project or globally at `~/.config/opencode/opencode.json`) to register the plugin and specify your Google Cloud Project ID.
+Update your OpenCode configuration file (typically `opencode.json` at the root of your project or globally at `~/.config/opencode/opencode.json`) to register the plugin.
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@anthonyhaussman/opencode-agy-auth"],
-  "provider": {
-    "google-agy": {
-      "options": {
-        "projectId": "your-google-cloud-project-id"
-      }
-    }
-  }
+  "plugin": ["@anthonyhaussman/opencode-agy-auth"]
 }
 ```
 
-By default, the plugin registers a specialized provider ID to interface with `agy`.
-You can switch your active OpenCode provider to `agy` or let the plugin inject authentication into your existing sessions.
+> **Note regarding `projectId`:**
+> Prior versions recommended setting a global `projectId` inside the `google-agy` provider options. With the introduction of the **Multi-Account Pool**, this is no longer recommended. 
+> The plugin now automatically captures and isolates the Project ID tied to each individual account you log in with. Removing the global `projectId` prevents premature quota exhaustion on a single project and allows the load to be safely distributed across accounts. Setting a global `projectId` will act as a strict override for all accounts.
 
 ### Environment Variables
 
 If you are running OpenCode in environments with specific requirements for Antigravity, you can use the following environment variables:
 
-- `OPENCODE_AGY_PROJECT_ID`: Specify your Google Cloud Project ID manually.
+- `OPENCODE_AGY_PROJECT_ID`: Specify your Google Cloud Project ID manually (global override).
 - `OPENCODE_AGY_AUTH_PROXY`: Define a proxy if accessing authentication endpoints behind a corporate firewall.
 - `OPENCODE_AGY_ENDPOINT`: Override the default internal `daily-cloudcode-pa.googleapis.com` API endpoint.
 - `OPENCODE_AGY_VERBOSE_LOGS`: Set to `"1"` to enable verbose diagnostic logs for API calls and responses.
@@ -51,10 +46,11 @@ If you are running OpenCode in environments with specific requirements for Antig
 
 Once installed and configured, OpenCode will automatically authenticate against Antigravity CLI when interacting with eligible models. If no active session exists, you will be prompted to complete an OAuth login.
 
-Additionally, you can check your quota using slash commands directly in your OpenCode prompt:
+You can manage your accounts and check your quota using slash commands directly in your OpenCode prompt:
 
-- `/agyquota` - Per-model detail view. Shows remaining tokens, progress bars, and reset timers for every model variant. Use when you need the full breakdown of individual buckets.
-- `/agyquotasummary` - High-level grouped view. Shows weekly and 5-hour limits aggregated by model family. Use when you want a quick overview of your allowance across all models.
+- `/agyswitch` - Manage your multi-account pool. Displays all logged-in accounts, lets you authenticate new ones, toggle specific accounts on/off, or manually switch the active account.
+- `/agyquota` - Per-model detail view. Shows remaining tokens, progress bars, and reset timers for every model variant.
+- `/agyquotasummary` - High-level grouped view. Shows weekly and 5-hour limits aggregated by model family.
 
 You can also ask naturally:
 > "What is my current agy quota?"
@@ -62,12 +58,12 @@ You can also ask naturally:
 
 ### Disk Persistence
 
-The plugin persists turn-state and retry-cooldown data to disk so that it survives OpenCode restarts. Files are stored under `~/.config/opencode/` (or `%APPDATA%\opencode\` on Windows):
+The plugin persists account lists and retry-cooldown data to disk so that it survives OpenCode restarts.
 
-- `antigravity-turn-states.json` - tracks thinking/reasoning state across request turns, with a 24-hour TTL and 5-second throttled writes using atomic tmp+rename.
-- Retry cooldowns are persisted via `CooldownStore` with the same atomic-write pattern.
-
-Both stores initialize lazily at runtime - no filesystem reads occur at import time.
+- **Persistent Data:**
+  - Account lists (`accounts.json`) and cooldown metrics (`retry-cooldowns.json`) are neatly stored under `~/.config/opencode/agy/` (or `%APPDATA%\opencode\agy\` on Windows).
+- **Ephemeral Data:**
+  - High-frequency tracking files that consume storage over time (like `antigravity-signature-cache.json` and `antigravity-turn-states.json`) are explicitly routed to your OS-level Temporary folder (`/tmp` or `%TEMP%`). They automatically get cleaned up by your OS, preserving your permanent disk space while still allowing sessions to survive short-term CLI restarts.
 
 #### `diskEnabled` Parameter
 
