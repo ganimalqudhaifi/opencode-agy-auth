@@ -170,6 +170,19 @@ const buildModelFromSimple = (modelId: string, simple: SimpleStaticModel): Provi
     family: modelId.includes('gemini') ? 'gemini' : (isClaude ? 'claude' : (isGpt ? 'gpt' : 'unknown')),
     status: 'active',
     release_date: '2026-05-26',
+    // Root-level properties for OpenCode v2 cache compatibility
+    reasoning: simple.reasoning,
+    attachment: simple.attachment,
+    tool_call: simple.toolCall,
+    temperature: true,
+    modalities: {
+      input: [
+        'text',
+        ...(simple.attachment ? ['image', 'pdf'] : []),
+        ...(!isClaude && !isGpt ? ['audio', 'video'] : [])
+      ],
+      output: ['text']
+    },
     capabilities: {
       temperature: true,
       reasoning: simple.reasoning,
@@ -208,7 +221,7 @@ const buildModelFromSimple = (modelId: string, simple: SimpleStaticModel): Provi
     },
     headers: {},
     variants
-  };
+  } as ProviderModel & Record<string, any>;
 };
 
 const STATIC_MODELS: Record<string, ProviderModel> = {};
@@ -319,19 +332,41 @@ export const AgyCLIOAuthPlugin = async ({ client }: PluginContext): Promise<Plug
 
   const getModelsList = (provider: ProviderV2): Record<string, ProviderModel> => {
     provider.models = provider.models || {};
-    for (const [modelId, modelDetails] of Object.entries(STATIC_MODELS)) {
+    const clonedStaticModels = JSON.parse(JSON.stringify(STATIC_MODELS));
+    for (const [modelId, modelDetails] of Object.entries(clonedStaticModels as Record<string, ProviderModel>)) {
+      const existing = (provider.models[modelId] || {}) as Partial<ProviderModel>;
       provider.models[modelId] = {
         ...modelDetails,
-        ...(provider.models[modelId] || {})
-      };
+        ...existing,
+        reasoning: (existing as any).reasoning ?? (modelDetails as any).reasoning,
+        attachment: (existing as any).attachment ?? (modelDetails as any).attachment,
+        tool_call: (existing as any).tool_call ?? (modelDetails as any).tool_call,
+        temperature: (existing as any).temperature ?? (modelDetails as any).temperature,
+        modalities: {
+          ...((modelDetails as any).modalities || {}),
+          ...((existing as any).modalities || {})
+        },
+        capabilities: {
+          ...(modelDetails.capabilities || {}),
+          ...(existing.capabilities || {}),
+          input: {
+            ...(modelDetails.capabilities?.input || {}),
+            ...(existing.capabilities?.input || {})
+          },
+          output: {
+            ...(modelDetails.capabilities?.output || {}),
+            ...(existing.capabilities?.output || {})
+          }
+        }
+      } as ProviderModel;
     }
 
     if (latestConfig && latestConfig.provider && latestConfig.provider[AGY_PROVIDER_ID]) {
-      latestConfig.provider[AGY_PROVIDER_ID].models = STATIC_MODELS;
+      latestConfig.provider[AGY_PROVIDER_ID].models = provider.models;
     }
     normalizeProviderModelCosts(provider);
 
-    return STATIC_MODELS;
+    return provider.models;
   };
 
   try {
@@ -392,7 +427,7 @@ export const AgyCLIOAuthPlugin = async ({ client }: PluginContext): Promise<Plug
       };
 
       // Provides a hardcoded static model list by default.
-      config.provider[AGY_PROVIDER_ID].models = STATIC_MODELS;
+      config.provider[AGY_PROVIDER_ID].models = JSON.parse(JSON.stringify(STATIC_MODELS));
     },
     tool: {
       [AGY_QUOTA_TOOL_NAME]: createAgyQuotaTool({
