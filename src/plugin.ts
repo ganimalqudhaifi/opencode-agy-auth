@@ -459,7 +459,7 @@ export const AgyCLIOAuthPlugin = async ({ client }: PluginContext): Promise<Plug
         getConfiguredProjectId: () => latestAgyConfiguredProjectId,
         getUserAgentModel: () => latestAgyUserAgentModel
       }),
-      [AGY_SWITCH_TOOL_NAME]: createAgySwitchTool()
+      [AGY_SWITCH_TOOL_NAME]: createAgySwitchTool(client)
     },
     auth: {
       provider: AGY_PROVIDER_ID,

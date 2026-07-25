@@ -1,11 +1,11 @@
 import { tool } from "@opencode-ai/plugin";
 import { AccountManager, detectModelFamily } from "./accounts";
-import type { ModelFamily } from "./types";
+import type { ModelFamily, PluginClient } from "./types";
 import { formatRelativeResetTime } from "./quota-utils";
 
 export const AGY_SWITCH_TOOL_NAME = "agy_switch_account";
 
-export function createAgySwitchTool() {
+export function createAgySwitchTool(client: PluginClient) {
   return tool({
     description:
       "List or switch the active account in the Antigravity multi-account pool.",
@@ -38,6 +38,18 @@ export function createAgySwitchTool() {
         }
 
         const selected = accounts[zeroIdx];
+        if (selected) {
+          const updatedAuth = accountMgr.toAuthDetails(selected);
+          try {
+            await client.auth.set({
+              path: { id: "google-agy" },
+              body: updatedAuth
+            });
+          } catch (e) {
+            console.warn(`[Agy Auth] Failed to push account to global auth: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+
         const label = selected?.email ? `${selected.email}` : `Account #${targetIdx}`;
         return `Successfully switched active account for [${targetFamilies.join(", ")}] to ${label} (#${targetIdx}).`;
       }
