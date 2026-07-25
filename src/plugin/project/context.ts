@@ -52,9 +52,9 @@ export async function resolveProjectContextFromAccessToken(
 ): Promise<ProjectContextResult> {
   const parts = parseRefreshParts(auth.refresh);
   const configuredProject = configuredProjectId?.trim();
-  const projectId = configuredProject || parts.projectId;
+  const projectId = parts.projectId || configuredProject;
 
-  if (!configuredProject && (projectId || parts.managedProjectId)) {
+  if ((projectId && projectId === parts.projectId) || parts.managedProjectId) {
     return {
       auth,
       effectiveProjectId: projectId || parts.managedProjectId || ''
