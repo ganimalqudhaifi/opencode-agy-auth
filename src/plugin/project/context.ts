@@ -57,7 +57,7 @@ export async function resolveProjectContextFromAccessToken(
   if ((projectId && projectId === parts.projectId) || parts.managedProjectId) {
     return {
       auth,
-      effectiveProjectId: projectId || parts.managedProjectId || ''
+      effectiveProjectId: parts.managedProjectId || projectId || ''
     };
   }
 
