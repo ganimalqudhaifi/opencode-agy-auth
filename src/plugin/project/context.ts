@@ -206,7 +206,7 @@ function withProjectAuth(
     ...auth,
     refresh: formatRefreshParts({
       refreshToken,
-      projectId,
+      projectId: managedProjectId ? undefined : projectId,
       managedProjectId
     })
   };
