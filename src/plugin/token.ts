@@ -7,6 +7,7 @@ import { agyFetch } from '../fetch';
 import { formatRefreshParts, parseRefreshParts } from './auth';
 import { clearCachedAuth, storeCachedAuth } from './cache';
 import { invalidateProjectContextCache } from './project';
+import { AccountManager } from './accounts';
 import {
   DEFAULT_MAX_ATTEMPTS,
   getExponentialDelayWithJitter,
@@ -128,6 +129,16 @@ async function refreshAccessTokenInternal(
         );
         clearCachedAuth(auth.refresh);
         invalidateProjectContextCache(auth.refresh);
+
+        try {
+          const accountMgr = await AccountManager.getInstance();
+          const target = accountMgr.getAccounts().find(a => a.parts.refreshToken === parts.refreshToken);
+          if (target) {
+            accountMgr.disableAccount(target.index);
+            console.warn(`[Agy Auth] Disabled revoked Account #${target.index + 1} (${target.email || 'Account ' + (target.index + 1)}) in pool.`);
+          }
+        } catch {}
+
         try {
           const clearedAuth = {
             type: 'oauth' as const,
@@ -174,6 +185,36 @@ async function refreshAccessTokenInternal(
     clearCachedAuth(auth.refresh);
     storeCachedAuth(updatedAuth);
     invalidateProjectContextCache(auth.refresh);
+
+    try {
+      const accountMgr = await AccountManager.getInstance();
+      const target = accountMgr.getAccounts().find(a => a.parts.refreshToken === parts.refreshToken);
+      let email: string | undefined = target?.email;
+
+      if (!email && updatedAuth.access) {
+        try {
+          const userRes = await agyFetch('https://www.googleapis.com/oauth2/v1/userinfo?alt=json', {
+            headers: { Authorization: `Bearer ${updatedAuth.access}` }
+          });
+          if (userRes.ok) {
+            const data = (await userRes.json()) as { email?: string };
+            if (data.email) {
+              email = data.email;
+            }
+          }
+        } catch {}
+      }
+
+      if (target) {
+        accountMgr.updateAccountAuth(target.index, updatedAuth);
+        if (email && !target.email) {
+          target.email = email;
+          accountMgr.saveToDisk();
+        }
+      } else {
+        accountMgr.addOrUpdateAccount(updatedAuth, email);
+      }
+    } catch {}
 
     if (refreshedParts.refreshToken !== parts.refreshToken) {
       try {

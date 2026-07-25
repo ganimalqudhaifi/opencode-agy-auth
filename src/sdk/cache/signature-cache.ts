@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
 
@@ -112,45 +112,8 @@ export interface ThinkingCacheData {
 /**
  * Get plugin config save directory
  */
-function getConfigDir(): string {
-  const platform = process.platform;
-  if (platform === "win32") {
-    return join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "opencode");
-  }
-  const xdgConfig = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  return join(xdgConfig, "opencode");
-}
-
-/**
- * Get absolute path for saving cache file
- */
 function getCacheFilePath(): string {
-  return join(getConfigDir(), "antigravity-signature-cache.json");
-}
-
-/**
- * Synchronously ensure the config file is added to .gitignore to avoid leaking signatures and cache
- */
-function ensureGitignoreSync(configDir: string): void {
-  const gitignorePath = join(configDir, ".gitignore");
-  const entries = [".gitignore", "antigravity-signature-cache.json"];
-  try {
-    let content = "";
-    if (existsSync(gitignorePath)) {
-      content = readFileSync(gitignorePath, "utf-8");
-    }
-    const existingLines = content.split("\n").map((line) => line.trim());
-    const missing = entries.filter((e) => !existingLines.includes(e));
-    if (missing.length === 0) return;
-    if (content === "") {
-      writeFileSync(gitignorePath, missing.join("\n") + "\n", "utf-8");
-    } else {
-      const suffix = content.endsWith("\n") ? "" : "\n";
-      appendFileSync(gitignorePath, suffix + missing.join("\n") + "\n", "utf-8");
-    }
-  } catch {
-    // Ignore exception: anti-leakage is a non-blocking secondary feature
-  }
+  return join(tmpdir(), "antigravity-signature-cache.json");
 }
 
 // =============================================================================
@@ -402,8 +365,6 @@ export class SignatureCache {
       if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true });
       }
-
-      ensureGitignoreSync(dir);
 
       const now = Date.now();
 

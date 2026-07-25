@@ -18,17 +18,8 @@ interface TurnStateData {
 
 const WRITE_THROTTLE_MS = 5000;
 
-function getConfigDir(): string {
-  const platform = process.platform;
-  if (platform === "win32") {
-    return join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "opencode");
-  }
-  const xdgConfig = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  return join(xdgConfig, "opencode");
-}
-
 function getTurnStateFilePath(): string {
-  return join(getConfigDir(), "antigravity-turn-states.json");
+  return join(tmpdir(), "antigravity-turn-states.json");
 }
 
 function loadTurnStatesFromDisk(): Map<string, TurnStateRecord> {
